@@ -1,0 +1,166 @@
+import subprocess
+import os
+from mastodon import Mastodon
+import mimetypes
+from datetime import datetime
+import logging
+from pathlib import Path
+import time
+import requests
+
+# ロギングの設定
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='/home/piine/logs/rice_monitor.log'
+)
+
+def ensure_directory_exists(directory_path):
+    """指定されたディレクトリが存在することを確認し、なければ作成する"""
+    path = Path(directory_path)
+    path.mkdir(parents=True, exist_ok=True)
+
+def take_photo(image_path, max_retries=3, retry_delay=2):
+    """libcamera-stillを使って写真を撮影する（リトライ機能付き）"""
+    for attempt in range(max_retries):
+        try:
+            # 画像保存ディレクトリの確認
+            ensure_directory_exists(os.path.dirname(image_path))
+            
+            # 写真撮影（タイムアウトを設定）
+            result = subprocess.run(
+                ['libcamera-still', '-o', image_path],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode != 0:
+                logging.error(f"写真の撮影に失敗しました (試行 {attempt+1}/{max_retries}): {result.stderr}")
+                if attempt < max_retries - 1:
+                    logging.info(f"{retry_delay}秒後に再試行します...")
+                    time.sleep(retry_delay)
+                    continue
+                return False
+                
+            logging.info(f"写真を撮影しました: {image_path}")
+            return True
+            
+        except subprocess.TimeoutExpired:
+            logging.error(f"写真撮影がタイムアウトしました (試行 {attempt+1}/{max_retries})")
+            if attempt < max_retries - 1:
+                logging.info(f"{retry_delay}秒後に再試行します...")
+                time.sleep(retry_delay)
+            else:
+                return False
+                
+        except Exception as e:
+            logging.error(f"写真撮影中にエラーが発生しました (試行 {attempt+1}/{max_retries}): {str(e)}")
+            if attempt < max_retries - 1:
+                logging.info(f"{retry_delay}秒後に再試行します...")
+                time.sleep(retry_delay)
+            else:
+                return False
+    
+    return False
+
+def wait_for_media_processing(mastodon, media_id, max_retries=10, retry_delay=1):
+    """メディアの処理が完了するまで待機する"""
+    for attempt in range(max_retries):
+        try:
+            # メディアのステータスを確認
+            media_status = mastodon.media(media_id)
+            
+            if media_status.get('url') is not None:
+                logging.info("メディア処理が完了しました")
+                return True
+                
+            logging.info(f"メディア処理中... ({attempt+1}/{max_retries})")
+            time.sleep(retry_delay)
+            
+        except Exception as e:
+            logging.error(f"メディアステータス取得中にエラー (試行 {attempt+1}/{max_retries}): {str(e)}")
+            time.sleep(retry_delay)
+    
+    logging.warning("メディア処理の完了を確認できませんでしたが、投稿を続行します")
+    return False
+
+def post_to_mastodon(image_path, status_text, max_retries=3, retry_delay=3):
+    """MastodonにメディアとStatusを投稿する（リトライ機能付き）"""
+    for attempt in range(max_retries):
+        try:
+            # Mastodonインスタンスを設定
+            mastodon = Mastodon(
+                access_token='hogehoge',
+                api_base_url='fugafuga'
+            )
+            
+            # MIMEタイプを特定
+            mime_type, encoding = mimetypes.guess_type(image_path)
+            if mime_type is None:
+                mime_type = 'application/octet-stream'
+            
+            # 画像ファイルが存在するか確認
+            if not os.path.exists(image_path):
+                logging.error(f"画像ファイルが見つかりません: {image_path}")
+                return False
+                
+            # Mastodonに画像を投稿
+            with open(image_path, 'rb') as image:
+                media_dict = mastodon.media_post(image, mime_type)
+                
+                # メディアアップロードの完了を待機
+                wait_for_media_processing(mastodon, media_dict['id'])
+                
+                # ステータス投稿
+                post_result = mastodon.status_post(
+                    status=status_text, 
+                    media_ids=[media_dict['id']]
+                )
+                logging.info(f"Mastodonに投稿しました: {post_result['url'] if 'url' in post_result else '投稿完了'}")
+                return True
+                
+        except requests.exceptions.RequestException as e:
+            logging.error(f"ネットワークエラーが発生しました (試行 {attempt+1}/{max_retries}): {str(e)}")
+            if attempt < max_retries - 1:
+                logging.info(f"{retry_delay}秒後に再試行します...")
+                time.sleep(retry_delay)
+            else:
+                return False
+                
+        except Exception as e:
+            logging.error(f"Mastodon投稿中にエラーが発生しました (試行 {attempt+1}/{max_retries}): {str(e)}")
+            if attempt < max_retries - 1:
+                logging.info(f"{retry_delay}秒後に再試行します...")
+                time.sleep(retry_delay)
+            else:
+                return False
+    
+    return False
+
+def main():
+    try:
+        # 現在の日時を取得
+        now = datetime.now()
+        formatted_month = now.strftime("%Y-%m")  # 月ごとのフォルダ用
+        formatted_date = now.strftime("%Y-%m-%d")  # 日付
+        formatted_time = now.strftime("%H-%M-%S")  # 時間
+        formatted_post_date = now.strftime("%m/%d %H:%M")  # 投稿コメント用
+        
+        # 写真ファイルパスの設定（月ごとに整理）
+        base_dir = '/home/piine/ine'
+        month_dir = os.path.join(base_dir, formatted_month)
+        image_path = os.path.join(month_dir, f"{formatted_date}_{formatted_time}.jpg")
+        
+        # 写真を撮影
+        if take_photo(image_path):
+            # Mastodonに投稿
+            status_text = f'{formatted_post_date} の稲の様子です #バケツ稲'
+            post_to_mastodon(image_path, status_text)
+        else:
+            logging.error("写真撮影に失敗したため、投稿をスキップします")
+    except Exception as e:
+        logging.error(f"予期せぬエラーが発生しました: {str(e)}")
+
+if __name__ == "__main__":
+    main()
